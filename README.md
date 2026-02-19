@@ -165,6 +165,8 @@ We use [changesets](https://github.com/changesets/changesets) for versioning and
 
 We love community contributions! Get started by reading our [CONTRIBUTING.md](CONTRIBUTING.md).
 
+All pull requests are automatically reviewed by our LLM reviewer to help maintain code quality and consistency.
+
 ---
 
 ## License
