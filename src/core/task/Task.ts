@@ -331,6 +331,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	checkpointTimeout: number
 	checkpointService?: RepoPerTaskCheckpointService
 	checkpointServiceInitializing = false
+	checkpointFailureCount = 0
 
 	// Task Bridge
 	enableBridge: boolean

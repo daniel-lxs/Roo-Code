@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach, Mock } from "vitest"
 import { Task } from "../../task/Task"
 import { ClineProvider } from "../../webview/ClineProvider"
-import { checkpointSave, checkpointRestore, checkpointDiff, getCheckpointService } from "../index"
+import {
+	checkpointSave,
+	checkpointRestore,
+	checkpointDiff,
+	getCheckpointService,
+	MAX_CONSECUTIVE_FAILURES,
+} from "../index"
 import { MessageManager } from "../../message-manager"
 import * as vscode from "vscode"
 
@@ -92,6 +98,7 @@ describe("Checkpoint functionality", () => {
 			enableCheckpoints: true,
 			checkpointService: mockCheckpointService,
 			checkpointServiceInitializing: false,
+			checkpointFailureCount: 0,
 			providerRef: {
 				deref: () => mockProvider,
 			},
@@ -199,13 +206,15 @@ describe("Checkpoint functionality", () => {
 			expect(mockTask.enableCheckpoints).toBe(true)
 		})
 
-		it("should handle errors gracefully and disable checkpoints", async () => {
+		it("should handle errors gracefully without disabling checkpoints on first failure", async () => {
 			mockCheckpointService.saveCheckpoint.mockRejectedValue(new Error("Save failed"))
 
 			const result = await checkpointSave(mockTask)
 
 			expect(result).toBeUndefined()
-			expect(mockTask.enableCheckpoints).toBe(false)
+			// First failure should NOT disable checkpoints (allows retry)
+			expect(mockTask.enableCheckpoints).toBe(true)
+			expect(mockTask.checkpointFailureCount).toBe(1)
 		})
 	})
 
@@ -282,7 +291,7 @@ describe("Checkpoint functionality", () => {
 			expect(mockCheckpointService.restoreCheckpoint).not.toHaveBeenCalled()
 		})
 
-		it("should disable checkpoints on error", async () => {
+		it("should not disable checkpoints on first restore error", async () => {
 			mockCheckpointService.restoreCheckpoint.mockRejectedValue(new Error("Restore failed"))
 
 			await checkpointRestore(mockTask, {
@@ -291,8 +300,12 @@ describe("Checkpoint functionality", () => {
 				mode: "restore",
 			})
 
-			expect(mockTask.enableCheckpoints).toBe(false)
-			expect(mockProvider.log).toHaveBeenCalledWith("[checkpointRestore] disabling checkpoints for this task")
+			// First failure should NOT disable checkpoints (allows retry)
+			expect(mockTask.enableCheckpoints).toBe(true)
+			expect(mockTask.checkpointFailureCount).toBe(1)
+			expect(mockProvider.log).toHaveBeenCalledWith(
+				expect.stringContaining("[checkpointRestore] checkpoint restore failed"),
+			)
 		})
 	})
 
@@ -391,7 +404,7 @@ describe("Checkpoint functionality", () => {
 			expect(vscode.commands.executeCommand).not.toHaveBeenCalled()
 		})
 
-		it("should disable checkpoints on error", async () => {
+		it("should not disable checkpoints on first diff error", async () => {
 			mockCheckpointService.getDiff.mockRejectedValue(new Error("Diff failed"))
 
 			await checkpointDiff(mockTask, {
@@ -400,8 +413,12 @@ describe("Checkpoint functionality", () => {
 				mode: "to-current",
 			})
 
-			expect(mockTask.enableCheckpoints).toBe(false)
-			expect(mockProvider.log).toHaveBeenCalledWith("[checkpointDiff] disabling checkpoints for this task")
+			// First failure should NOT disable checkpoints (allows retry)
+			expect(mockTask.enableCheckpoints).toBe(true)
+			expect(mockTask.checkpointFailureCount).toBe(1)
+			expect(mockProvider.log).toHaveBeenCalledWith(
+				expect.stringContaining("[checkpointDiff] checkpoint diff failed"),
+			)
 		})
 	})
 
@@ -588,6 +605,106 @@ describe("Checkpoint functionality", () => {
 			// Test timeout error message i18n key
 			const errorMessage = i18nModule.t("common:errors.init_checkpoint_fail_long_time", { timeout: 30 })
 			expect(errorMessage).toBe("Checkpoint initialization failed after 30 seconds")
+		})
+	})
+
+	describe("failure recovery and consecutive failure tracking", () => {
+		it("should disable checkpoints after MAX_CONSECUTIVE_FAILURES save errors", async () => {
+			mockCheckpointService.saveCheckpoint.mockRejectedValue(new Error("Save failed"))
+
+			for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
+				await checkpointSave(mockTask)
+			}
+
+			expect(mockTask.enableCheckpoints).toBe(false)
+			expect(mockTask.checkpointFailureCount).toBe(MAX_CONSECUTIVE_FAILURES)
+		})
+
+		it("should reset failure count after a successful save", async () => {
+			mockCheckpointService.saveCheckpoint
+				.mockRejectedValueOnce(new Error("Save failed"))
+				.mockRejectedValueOnce(new Error("Save failed"))
+				.mockResolvedValueOnce({ commit: "success-hash" })
+
+			// Two failures
+			await checkpointSave(mockTask)
+			await checkpointSave(mockTask)
+			expect(mockTask.checkpointFailureCount).toBe(2)
+			expect(mockTask.enableCheckpoints).toBe(true)
+
+			// One success resets the counter
+			await checkpointSave(mockTask)
+			expect(mockTask.checkpointFailureCount).toBe(0)
+			expect(mockTask.enableCheckpoints).toBe(true)
+		})
+
+		it("should reset failure count after a successful restore", async () => {
+			// Simulate prior failures
+			mockTask.checkpointFailureCount = 2
+			mockTask.clineMessages = [
+				{ ts: 1, say: "user", text: "Message 1" },
+				{ ts: 2, say: "checkpoint_saved", text: "abc123" },
+			]
+
+			await checkpointRestore(mockTask, {
+				ts: 2,
+				commitHash: "abc123",
+				mode: "preview",
+			})
+
+			expect(mockTask.checkpointFailureCount).toBe(0)
+			expect(mockTask.enableCheckpoints).toBe(true)
+		})
+
+		it("should disable checkpoints after MAX_CONSECUTIVE_FAILURES restore errors", async () => {
+			mockCheckpointService.restoreCheckpoint.mockRejectedValue(new Error("Restore failed"))
+			mockTask.clineMessages = [
+				{ ts: 1, say: "user", text: "Message 1" },
+				{ ts: 2, say: "checkpoint_saved", text: "abc123" },
+			]
+
+			for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
+				await checkpointRestore(mockTask, {
+					ts: 2,
+					commitHash: "abc123",
+					mode: "restore",
+				})
+			}
+
+			expect(mockTask.enableCheckpoints).toBe(false)
+			expect(mockTask.checkpointFailureCount).toBe(MAX_CONSECUTIVE_FAILURES)
+		})
+
+		it("should disable checkpoints after MAX_CONSECUTIVE_FAILURES diff errors", async () => {
+			mockCheckpointService.getDiff.mockRejectedValue(new Error("Diff failed"))
+
+			for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
+				await checkpointDiff(mockTask, {
+					ts: 4,
+					commitHash: "commit2",
+					mode: "to-current",
+				})
+			}
+
+			expect(mockTask.enableCheckpoints).toBe(false)
+			expect(mockTask.checkpointFailureCount).toBe(MAX_CONSECUTIVE_FAILURES)
+		})
+
+		it("should allow recovery after transient save failure", async () => {
+			mockCheckpointService.saveCheckpoint
+				.mockRejectedValueOnce(new Error("Save failed"))
+				.mockResolvedValueOnce({ commit: "recovered-hash" })
+
+			// First call fails but doesn't disable
+			const result1 = await checkpointSave(mockTask)
+			expect(result1).toBeUndefined()
+			expect(mockTask.enableCheckpoints).toBe(true)
+
+			// Second call succeeds
+			const result2 = await checkpointSave(mockTask)
+			expect(result2).toEqual({ commit: "recovered-hash" })
+			expect(mockTask.enableCheckpoints).toBe(true)
+			expect(mockTask.checkpointFailureCount).toBe(0)
 		})
 	})
 })
