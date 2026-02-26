@@ -18,11 +18,46 @@ import { CheckpointServiceOptions, RepoPerTaskCheckpointService } from "../../se
 
 const WARNING_THRESHOLD_MS = 5000
 
+/**
+ * Maximum number of consecutive checkpoint operation failures before
+ * permanently disabling checkpoints for the task. This prevents a
+ * single transient error (e.g., git lock file, temp disk issue) from
+ * permanently bricking the checkpoint system, while still disabling
+ * after repeated failures that indicate a systemic problem.
+ */
+export const MAX_CONSECUTIVE_FAILURES = 3
+
 function sendCheckpointInitWarn(task: Task, type?: "WAIT_TIMEOUT" | "INIT_TIMEOUT", timeout?: number) {
 	task.providerRef.deref()?.postMessageToWebview({
 		type: "checkpointInitWarning",
 		checkpointWarning: type && timeout ? { type, timeout } : undefined,
 	})
+}
+
+/**
+ * Track a transient checkpoint failure. Returns true if checkpoints
+ * should be permanently disabled (i.e., we've exceeded the max
+ * consecutive failure threshold).
+ */
+function trackCheckpointFailure(task: Task): boolean {
+	task.checkpointFailureCount++
+
+	if (task.checkpointFailureCount >= MAX_CONSECUTIVE_FAILURES) {
+		console.error(
+			`[checkpoints] ${task.checkpointFailureCount} consecutive failures, permanently disabling checkpoints for task ${task.taskId}`,
+		)
+		task.enableCheckpoints = false
+		return true
+	}
+
+	return false
+}
+
+/**
+ * Reset the consecutive failure counter after a successful operation.
+ */
+function resetCheckpointFailureCount(task: Task) {
+	task.checkpointFailureCount = 0
 }
 
 export async function getCheckpointService(task: Task, { interval = 250 }: { interval?: number } = {}) {
@@ -113,17 +148,25 @@ export async function getCheckpointService(task: Task, { interval = 250 }: { int
 		const service = RepoPerTaskCheckpointService.create(options)
 		task.checkpointServiceInitializing = true
 		await checkGitInstallation(task, service, log, provider)
-		task.checkpointService = service
-		if (task.enableCheckpoints) {
+
+		// Only assign the service if initialization succeeded (checkGitInstallation
+		// resets checkpointServiceInitializing on failure to allow retries)
+		if (task.enableCheckpoints && !task.checkpointService) {
+			task.checkpointService = service
 			sendCheckpointInitWarn(task)
 		}
-		return service
+		return task.checkpointService
 	} catch (err) {
 		if (err.name === "TimeoutError" && task.enableCheckpoints) {
 			sendCheckpointInitWarn(task, "INIT_TIMEOUT", task.checkpointTimeout)
+			// Timeout during init is a permanent failure for this attempt
+			task.enableCheckpoints = false
+		} else {
+			// For non-timeout errors, use failure tracking to allow retries
+			trackCheckpointFailure(task)
 		}
 		log(`[Task#getCheckpointService] ${err.message}`)
-		task.enableCheckpoints = false
+		task.checkpointService = undefined
 		task.checkpointServiceInitializing = false
 		return undefined
 	}
@@ -187,9 +230,9 @@ async function checkGitInstallation(
 					console.error(err)
 				})
 			} catch (err) {
-				log("[Task#getCheckpointService] caught unexpected error in on('checkpoint'), disabling checkpoints")
+				// Don't disable checkpoints for notification errors - the checkpoint itself was saved successfully.
+				log("[Task#getCheckpointService] caught unexpected error in on('checkpoint') event handler")
 				console.error(err)
-				task.enableCheckpoints = false
 			}
 		})
 
@@ -199,13 +242,18 @@ async function checkGitInstallation(
 			await service.initShadowGit()
 		} catch (err) {
 			log(`[Task#getCheckpointService] initShadowGit -> ${err.message}`)
-			task.enableCheckpoints = false
+			// Reset state to allow re-initialization on next attempt instead of permanently disabling.
+			// The shadow git init may fail due to transient issues (lock files, disk space, etc.).
+			task.checkpointService = undefined
+			task.checkpointServiceInitializing = false
+			trackCheckpointFailure(task)
 		}
 	} catch (err) {
 		log(`[Task#getCheckpointService] Unexpected error during Git check: ${err.message}`)
 		console.error("Git check error:", err)
-		task.enableCheckpoints = false
+		task.checkpointService = undefined
 		task.checkpointServiceInitializing = false
+		trackCheckpointFailure(task)
 	}
 }
 
@@ -221,9 +269,13 @@ export async function checkpointSave(task: Task, force = false, suppressMessage 
 	// Start the checkpoint process in the background.
 	return service
 		.saveCheckpoint(`Task: ${task.taskId}, Time: ${Date.now()}`, { allowEmpty: force, suppressMessage })
+		.then((result) => {
+			resetCheckpointFailureCount(task)
+			return result
+		})
 		.catch((err) => {
-			console.error("[Task#checkpointSave] caught unexpected error, disabling checkpoints", err)
-			task.enableCheckpoints = false
+			console.error("[Task#checkpointSave] caught unexpected error during checkpoint save", err)
+			trackCheckpointFailure(task)
 		})
 }
 
@@ -255,6 +307,7 @@ export async function checkpointRestore(
 	try {
 		await service.restoreCheckpoint(commitHash)
 		TelemetryService.instance.captureCheckpointRestored(task.taskId)
+		resetCheckpointFailureCount(task)
 		await provider?.postMessageToWebview({ type: "currentCheckpointUpdated", text: commitHash })
 
 		if (mode === "restore") {
@@ -296,8 +349,10 @@ export async function checkpointRestore(
 		// `Task` instance.
 		provider?.cancelTask()
 	} catch (err) {
-		provider?.log("[checkpointRestore] disabling checkpoints for this task")
-		task.enableCheckpoints = false
+		const disabled = trackCheckpointFailure(task)
+		provider?.log(
+			`[checkpointRestore] checkpoint restore failed${disabled ? ", permanently disabling checkpoints" : ", will retry on next attempt"}: ${err instanceof Error ? err.message : String(err)}`,
+		)
 	}
 }
 
@@ -371,6 +426,8 @@ export async function checkpointDiff(task: Task, { ts, previousCommitHash, commi
 			return
 		}
 
+		resetCheckpointFailureCount(task)
+
 		await vscode.commands.executeCommand(
 			"vscode.changes",
 			title,
@@ -386,7 +443,9 @@ export async function checkpointDiff(task: Task, { ts, previousCommitHash, commi
 		)
 	} catch (err) {
 		const provider = task.providerRef.deref()
-		provider?.log("[checkpointDiff] disabling checkpoints for this task")
-		task.enableCheckpoints = false
+		const disabled = trackCheckpointFailure(task)
+		provider?.log(
+			`[checkpointDiff] checkpoint diff failed${disabled ? ", permanently disabling checkpoints" : ", will retry on next attempt"}: ${err instanceof Error ? err.message : String(err)}`,
+		)
 	}
 }
