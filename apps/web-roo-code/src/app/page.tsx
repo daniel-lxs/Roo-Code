@@ -1,3 +1,4 @@
+// Main marketing homepage entry point
 import { Button } from "@/components/ui"
 import {
 	CompanyLogos,
